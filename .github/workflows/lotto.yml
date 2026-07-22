@@ -1,0 +1,53 @@
+# Copy this file into a GitHub repo you own as:
+#   .github/workflows/lotto.yml
+#
+# It fetches the Lotterywest API every 15 minutes and commits the JSON to
+# `data/lotto.json`. Then in this Lovable project, set the env var
+#   VITE_LOTTO_JSON_URL=https://raw.githubusercontent.com/<user>/<repo>/main/data/lotto.json
+# and the site will read from GitHub instead of corsproxy.io.
+#
+# Notes:
+#  - The runner reaches Lotterywest server-to-server, so there is no CORS issue.
+#  - raw.githubusercontent.com serves permissive CORS headers, so the browser
+#    can read the JSON directly.
+#  - Free GitHub Actions minutes are plenty for a 15-minute cron.
+
+name: Sync Lotterywest results
+
+on:
+  schedule:
+    # Every 15 minutes. Tighten to */5 if you want more frequent updates.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Lotterywest JSON
+        run: |
+          mkdir -p data
+          curl -fsSL \
+            -H "accept: application/json" \
+            -H "user-agent: Mozilla/5.0 (github-actions lotto-sync)" \
+            "https://www.lotterywest.wa.gov.au/api/games" \
+            -o data/lotto.json
+          # Fail loudly if the response isn't valid JSON.
+          python3 -c "import json,sys; json.load(open('data/lotto.json'))"
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "lotto-sync-bot"
+          git config user.email "lotto-sync-bot@users.noreply.github.com"
+          if [[ -n "$(git status --porcelain data/lotto.json)" ]]; then
+            git add data/lotto.json
+            git commit -m "chore: refresh lotto data ($(date -u +%FT%TZ))"
+            git push
+          else
+            echo "No changes."
+          fi
