@@ -16,9 +16,9 @@ name: Sync Lotterywest results
 
 on:
   schedule:
-    # GitHub 的 schedule 在高峰期经常被延迟甚至跳过，所以设成每 5 分钟一次，
+    # GitHub 的 schedule 在高峰期经常被延迟甚至跳过，所以设成每 15 分钟一次，
     # 并且在同一次运行里循环抓取多轮，减少「整段时间没更新」的概率。
-    - cron: "*/5 * * * *"
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 permissions:
