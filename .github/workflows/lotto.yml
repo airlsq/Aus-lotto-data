@@ -16,38 +16,64 @@ name: Sync Lotterywest results
 
 on:
   schedule:
-    # Every 15 minutes. Tighten to */5 if you want more frequent updates.
-    - cron: "*/15 * * * *"
+    # GitHub 的 schedule 在高峰期经常被延迟甚至跳过，所以设成每 5 分钟一次，
+    # 并且在同一次运行里循环抓取多轮，减少「整段时间没更新」的概率。
+    - cron: "*/5 * * * *"
   workflow_dispatch: {}
 
 permissions:
   contents: write
 
+concurrency:
+  group: lotto-sync
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - name: Fetch Lotterywest JSON
+      - name: Fetch and commit (multiple passes)
         run: |
-          mkdir -p data
-          curl -fsSL \
-            -H "accept: application/json" \
-            -H "user-agent: Mozilla/5.0 (github-actions lotto-sync)" \
-            "https://www.lotterywest.wa.gov.au/api/games" \
-            -o data/lotto.json
-          # Fail loudly if the response isn't valid JSON.
-          python3 -c "import json,sys; json.load(open('data/lotto.json'))"
-
-      - name: Commit if changed
-        run: |
+          set -euo pipefail
           git config user.name  "lotto-sync-bot"
           git config user.email "lotto-sync-bot@users.noreply.github.com"
-          if [[ -n "$(git status --porcelain data/lotto.json)" ]]; then
-            git add data/lotto.json
-            git commit -m "chore: refresh lotto data ($(date -u +%FT%TZ))"
-            git push
-          else
-            echo "No changes."
-          fi
+          mkdir -p data
+
+          fetch_once() {
+            for attempt in 1 2 3; do
+              if curl -fsSL --max-time 30 \
+                -H "accept: application/json" \
+                -H "user-agent: Mozilla/5.0 (github-actions lotto-sync)" \
+                "https://www.lotterywest.wa.gov.au/api/games" \
+                -o /tmp/lotto.json; then
+                if python3 -c "import json; json.load(open('/tmp/lotto.json'))"; then
+                  cp /tmp/lotto.json data/lotto.json
+                  return 0
+                fi
+              fi
+              echo "attempt $attempt failed, retrying..."
+              sleep 10
+            done
+            return 1
+          }
+
+          # 5 轮 x 每轮间隔 60 秒 ≈ 覆盖 5 分钟，衔接下一次 cron。
+          for i in 1 2 3 4 5; do
+            if fetch_once; then
+              if [[ -n "$(git status --porcelain data/lotto.json)" ]]; then
+                git add data/lotto.json
+                git commit -m "chore: refresh lotto data ($(date -u +%FT%TZ))"
+                git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+                git push
+              else
+                echo "No changes (pass $i)."
+              fi
+            else
+              echo "Fetch failed (pass $i)."
+            fi
+            [[ $i -lt 5 ]] && sleep 60 || true
+          done
+
