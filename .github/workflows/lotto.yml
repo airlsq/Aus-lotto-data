@@ -1,24 +1,20 @@
-# Copy this file into a GitHub repo you own as:
-#   .github/workflows/lotto.yml
+# Copy this file into your data repo as:
+#   .github/workflows/lotto.yml   (airlsq/Aus-lotto-data)
 #
-# It fetches the Lotterywest API every 15 minutes and commits the JSON to
-# `data/lotto.json`. Then in this Lovable project, set the env var
-#   VITE_LOTTO_JSON_URL=https://raw.githubusercontent.com/<user>/<repo>/main/data/lotto.json
-# and the site will read from GitHub instead of corsproxy.io.
-#
-# Notes:
-#  - The runner reaches Lotterywest server-to-server, so there is no CORS issue.
-#  - raw.githubusercontent.com serves permissive CORS headers, so the browser
-#    can read the JSON directly.
-#  - Free GitHub Actions minutes are plenty for a 15-minute cron.
+# 为什么改成「长跑」模式：
+# GitHub 的 schedule cron 在公共 runner 高峰期会被大量延迟甚至直接跳过。
+# 实测 8/29 全天只触发了 3 次（00:00 / 07:00 / 13:02 UTC），所以 */15 的 cron
+# 完全不可靠。解决办法：每次运行都在同一个 job 内持续循环抓取（最长 5.5 小时），
+# 这样即使一天只被触发 3~4 次，也能几乎全天候覆盖。
+# 公共仓库的 Actions 分钟数是免费无限的，长跑不额外收费。
 
 name: Sync Lotterywest results
 
 on:
   schedule:
-    # GitHub 的 schedule 在高峰期经常被延迟甚至跳过，所以设成每 15 分钟一次，
-    # 并且在同一次运行里循环抓取多轮，减少「整段时间没更新」的概率。
-    - cron: "*/15 * * * *"
+    # 每 30 分钟尝试触发一次；配合 cancel-in-progress，新的一次会顶掉旧的长跑，
+    # 保证始终有一个「活着」的抓取循环。
+    - cron: "*/30 * * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -26,18 +22,24 @@ permissions:
 
 concurrency:
   group: lotto-sync
-  cancel-in-progress: false
+  # 新运行接替旧运行，避免排队堆积导致实际不执行
+  cancel-in-progress: true
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v5
 
-      - name: Fetch and commit (multiple passes)
+      - name: Long-running fetch loop
+        env:
+          # 循环总时长（分钟），略小于 timeout-minutes
+          RUN_MINUTES: "340"
+          # 抓取间隔（秒）
+          INTERVAL_SECONDS: "60"
         run: |
-          set -euo pipefail
+          set -uo pipefail
           git config user.name  "lotto-sync-bot"
           git config user.email "lotto-sync-bot@users.noreply.github.com"
           mkdir -p data
@@ -49,7 +51,7 @@ jobs:
                 -H "user-agent: Mozilla/5.0 (github-actions lotto-sync)" \
                 "https://www.lotterywest.wa.gov.au/api/games" \
                 -o /tmp/lotto.json; then
-                if python3 -c "import json; json.load(open('/tmp/lotto.json'))"; then
+                if python3 -c "import json,sys; d=json.load(open('/tmp/lotto.json')); sys.exit(0 if d else 1)"; then
                   cp /tmp/lotto.json data/lotto.json
                   return 0
                 fi
@@ -60,20 +62,24 @@ jobs:
             return 1
           }
 
-          # 5 轮 x 每轮间隔 60 秒 ≈ 覆盖 5 分钟，衔接下一次 cron。
-          for i in 1 2 3 4 5; do
-            if fetch_once; then
-              if [[ -n "$(git status --porcelain data/lotto.json)" ]]; then
-                git add data/lotto.json
-                git commit -m "chore: refresh lotto data ($(date -u +%FT%TZ))"
+          commit_if_changed() {
+            if [[ -n "$(git status --porcelain data/lotto.json)" ]]; then
+              git add data/lotto.json
+              git commit -m "chore: refresh lotto data ($(date -u +%FT%TZ))" || return 0
+              for push_try in 1 2 3; do
                 git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
-                git push
-              else
-                echo "No changes (pass $i)."
-              fi
+                if git push; then return 0; fi
+                echo "push failed (try $push_try)"
+                sleep 5
+              done
             else
-              echo "Fetch failed (pass $i)."
+              echo "no change $(date -u +%FT%TZ)"
             fi
-            [[ $i -lt 5 ]] && sleep 60 || true
-          done
+          }
 
+          END=$(( $(date +%s) + RUN_MINUTES * 60 ))
+          while [[ $(date +%s) -lt $END ]]; do
+            if fetch_once; then commit_if_changed; else echo "fetch failed $(date -u +%FT%TZ)"; fi
+            sleep "$INTERVAL_SECONDS"
+          done
+          echo "loop finished"
